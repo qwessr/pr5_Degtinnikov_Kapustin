@@ -1,8 +1,11 @@
 ﻿using System;
-using System.ComponentModel;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using Server.Classes;
 
 namespace Server
@@ -11,61 +14,72 @@ namespace Server
     {
         static IPAddress ServerIpAddress;
         static int ServerPort;
-        static int MaxClient;
-        static int Duration;
-        static List<Classes.Client> AllClients = new List<Classes.Client>();
+        static int MaxClients;
+        static int TokenDuration;
+        static List<Client> ActiveClients = new List<Client>();
+
         static void Main(string[] args)
         {
+            CreateDatabase();
             OnSettings();
 
-            Thread tListenel = new Thread(ConnectServer);
-            tListenel.Start();
+            Thread listenerThread = new Thread(ListenForClients);
+            listenerThread.Start();
 
-            Thread tDisconnect = new Thread(CheckDisconnectClient);
-            tDisconnect.Start();
+            Thread disconnectThread = new Thread(CheckDisconnectedClients);
+            disconnectThread.Start();
+
             while (true)
             {
                 SetCommand();
             }
         }
 
-        static void CheckDisconnectClient()
+        static void CreateDatabase()
+        {
+            using var db = new DbContexted();
+            db.Database.EnsureCreated();
+        }
+
+        static void CheckDisconnectedClients()
         {
             while (true)
             {
-                for (int iClient = 0; iClient < AllClients.Count; iClient++)
+                lock (ActiveClients)
                 {
-                    int ClientDuration = (int)DateTime.Now.Subtract(AllClients[iClient].DateConnect).TotalSeconds;
-
-                    if (ClientDuration > Duration)
+                    for (int i = ActiveClients.Count - 1; i >= 0; i--)
                     {
-                        Console.ForegroundColor = ConsoleColor.White;
-                        Console.WriteLine($"Client: {AllClients[iClient].Token} disconnect from server to timeout");
+                        int clientDuration = (int)DateTime.Now.Subtract(ActiveClients[i].DateConnect).TotalSeconds;
 
-                        AllClients.RemoveAt(iClient);
+                        if (clientDuration > TokenDuration)
+                        {
+                            Console.WriteLine($"Client {ActiveClients[i].Token} disconnected (timeout)");
+                            ActiveClients.RemoveAt(i);
+                        }
                     }
                 }
                 Thread.Sleep(1000);
             }
         }
+
         public static void GetStatus()
         {
-            Console.ForegroundColor = ConsoleColor.White;
-            Console.WriteLine($"Count Clients: {AllClients.Count}");
-            foreach (Classes.Client Client in AllClients)
+            Console.WriteLine($"\nActive clients: {ActiveClients.Count}/{MaxClients}");
+
+            if (ActiveClients.Count > 0)
             {
-                int Duration = (int)DateTime.Now.Subtract(Client.DateConnect).TotalSeconds;
-                Console.ForegroundColor = ConsoleColor.White;
-                Console.WriteLine($"Client: {Client.Token}, time connection: {Client.DateConnect.ToString("HH:mm:ss dd.MM")}, " +
-                    $"duration: {Duration}"
-                    );
+                Console.WriteLine("Connected clients:");
+                foreach (Client client in ActiveClients)
+                {
+                    int duration = (int)DateTime.Now.Subtract(client.DateConnect).TotalSeconds;
+                    Console.WriteLine($"  Token: {client.Token}, Login: {client.Login}, Duration: {duration}s");
+                }
             }
-
-
         }
+
         public static void SetCommand()
         {
-            Console.ForegroundColor = ConsoleColor.Red;
+            Console.Write("Server> ");
             string Command = Console.ReadLine();
 
             if (Command == "/config")
@@ -73,63 +87,50 @@ namespace Server
                 File.Delete(Directory.GetCurrentDirectory() + "/.config");
                 OnSettings();
             }
-            else if (Command.Contains("/disconnect")) DisconnectServer(Command);
+            else if (Command.StartsWith("/disconnect")) DisconnectClient(Command);
             else if (Command == "/status") GetStatus();
             else if (Command == "/help") Help();
-            else if (Command == "/ban") Ban(Command);
-            else if (Command == "/unblock") Unblock(Command);
+            else if (Command == "/ban") BanUser();
+            else if (Command == "/unban") UnbanUser();
+            else if (Command == "/users") ShowAllUsers();
         }
 
-        public static void Unblock(string command)
+        static void ShowAllUsers()
         {
-            Console.Write("Login: ");
-            string login = Console.ReadLine();
-            if (string.IsNullOrEmpty(login))
+            using var db = new DbContexted();
+            var users = db.Users.ToList();
+
+            Console.WriteLine("\nRegistered users:");
+            foreach (var user in users)
             {
-                Console.WriteLine("Login not specified");
-                return;
+                Console.WriteLine($"  ID: {user.Id}, Login: {user.Login}");
             }
+        }
+
+        public static void UnbanUser()
+        {
+            Console.Write("Enter login to unban: ");
+            string login = Console.ReadLine();
 
             using var db = new DbContexted();
+            var blackListRecord = db.BlackLists.FirstOrDefault(x => x.Login == login);
 
-            if (!db.Users.Any(x => x.Login == login))
+            if (blackListRecord != null)
             {
-                Console.WriteLine("User not found");
-                return;
+                db.BlackLists.Remove(blackListRecord);
+                db.SaveChanges();
+                Console.WriteLine($"User {login} has been unbanned");
             }
-
-            var blackListRecord = db.blackLists.FirstOrDefault(x => x.Login == login);
-
-            if (blackListRecord == null)
+            else
             {
                 Console.WriteLine("User is not banned");
-                return;
-            }
-
-            int recordId = blackListRecord.Id;
-
-            var recordToDelete = db.blackLists.Find(recordId);
-            if (recordToDelete != null)
-            {
-                db.blackLists.Remove(recordToDelete);
-                db.SaveChanges();
-
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine($"User {login} unbanned");
-                Console.ResetColor();
             }
         }
 
-        public static void Ban(string command)
+        public static void BanUser()
         {
-
-            Console.Write("Login: ");
+            Console.Write("Enter login to ban: ");
             string login = Console.ReadLine();
-            if (string.IsNullOrEmpty(login))
-            {
-                Console.WriteLine("Login not specified");
-                return;
-            }
 
             using var db = new DbContexted();
 
@@ -139,137 +140,106 @@ namespace Server
                 return;
             }
 
-            if (db.blackLists.Any(x => x.Login == login))
+            if (!db.BlackLists.Any(x => x.Login == login))
             {
-                Console.WriteLine("User already banned");
-                return;
+                db.BlackLists.Add(new BlackList { Login = login });
+                db.SaveChanges();
+
+                lock (ActiveClients)
+                {
+                    var activeClient = ActiveClients.FirstOrDefault(c => c.Login == login);
+                    if (activeClient != null)
+                    {
+                        ActiveClients.Remove(activeClient);
+                        Console.WriteLine($"Active session for {login} terminated");
+                    }
+                }
+
+                Console.WriteLine($"User {login} added to blacklist");
             }
-
-            db.blackLists.Add(new BlackList { Login = login });
-            db.SaveChanges();
-
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"User {login} added to blacklist");
+            else
+            {
+                Console.WriteLine("User is already banned");
+            }
         }
-        static void DisconnectServer(string сommand)
+
+        static void DisconnectClient(string command)
         {
-            try
-            {
-                string Token = сommand.Replace("/disconnect", "").Trim();
-                Classes.Client DisconnectClient = AllClients.Find(x => x.Token == Token);
-                AllClients.Remove(DisconnectClient);
+            string token = command.Replace("/disconnect", "").Trim();
 
-                Console.ForegroundColor = ConsoleColor.White;
-                Console.Write($"Client: {Token} disconnect from server");
-            }
-            catch (Exception exp)
+            lock (ActiveClients)
             {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine("Error: " + exp.Message);
-            }
+                Client disconnectClient = ActiveClients.FirstOrDefault(x => x.Token == token);
 
+                if (disconnectClient != null)
+                {
+                    ActiveClients.Remove(disconnectClient);
+                    Console.WriteLine($"Client {token} disconnected");
+                }
+            }
         }
 
         public static void Help()
         {
-            Console.ForegroundColor = ConsoleColor.White;
-            Console.WriteLine("Commands to the server: ");
-
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.Write("/config");
-            Console.ForegroundColor = ConsoleColor.White;
-            Console.WriteLine(" - set initial settings ");
-
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.Write("/disconnect");
-            Console.ForegroundColor = ConsoleColor.White;
-            Console.WriteLine(" - disconnect users from the server ");
-
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.Write("/status");
-            Console.ForegroundColor = ConsoleColor.White;
-            Console.WriteLine(" - show list users ");
+            Console.WriteLine("\nServer commands:");
+            Console.WriteLine("  /config - change server settings");
+            Console.WriteLine("  /disconnect [token] - disconnect client");
+            Console.WriteLine("  /status - show server status");
+            Console.WriteLine("  /ban - add user to blacklist");
+            Console.WriteLine("  /unban - remove user from blacklist");
+            Console.WriteLine("  /users - show all users");
+            Console.WriteLine("  /help - show this help\n");
         }
 
         public static void OnSettings()
         {
-            string Path = Directory.GetCurrentDirectory() + "/.config";
-            string IpAddress = "";
+            string configPath = Directory.GetCurrentDirectory() + "/.config";
 
-            if (File.Exists(Path))
+            if (File.Exists(configPath))
             {
-                StreamReader streamReader = new StreamReader(Path);
-                IpAddress = streamReader.ReadLine();
-                ServerIpAddress = IPAddress.Parse(IpAddress);
-                ServerPort = int.Parse(streamReader.ReadLine());
-                MaxClient = int.Parse(streamReader.ReadLine());
-                Duration = int.Parse(streamReader.ReadLine());
-                streamReader.Close();
+                using StreamReader reader = new StreamReader(configPath);
+                ServerIpAddress = IPAddress.Parse(reader.ReadLine());
+                ServerPort = int.Parse(reader.ReadLine());
+                MaxClients = int.Parse(reader.ReadLine());
+                TokenDuration = int.Parse(reader.ReadLine());
+                reader.Close();
 
-                Console.ForegroundColor = ConsoleColor.White;
-                Console.Write("Server address: ");
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine(IpAddress);
-
-                Console.ForegroundColor = ConsoleColor.White;
-                Console.Write("Server port: ");
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine(ServerPort.ToString());
-
-                Console.ForegroundColor = ConsoleColor.White;
-                Console.Write("Max count clients: ");
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine(MaxClient.ToString());
-
-                Console.ForegroundColor = ConsoleColor.White;
-                Console.Write("Token lifetime: ");
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine(Duration.ToString());
+                Console.WriteLine($"Loaded settings: {ServerIpAddress}:{ServerPort}, Max clients: {MaxClients}, Token lifetime: {TokenDuration}s");
             }
             else
             {
-                Console.ForegroundColor = ConsoleColor.White;
-                Console.Write("Please provide the IP address if the license server: ");
-                Console.ForegroundColor = ConsoleColor.Green;
-                IpAddress = Console.ReadLine();
-                ServerIpAddress = IPAddress.Parse(IpAddress);
+                Console.Write("Server IP [127.0.0.1]: ");
+                string ip = Console.ReadLine();
+                ServerIpAddress = string.IsNullOrEmpty(ip) ? IPAddress.Parse("127.0.0.1") : IPAddress.Parse(ip);
 
-                Console.ForegroundColor = ConsoleColor.White;
-                Console.Write("Please specify the license server port: ");
-                Console.ForegroundColor = ConsoleColor.Green;
-                ServerPort = int.Parse(Console.ReadLine());
+                Console.Write("Server port [5000]: ");
+                string port = Console.ReadLine();
+                ServerPort = string.IsNullOrEmpty(port) ? 5000 : int.Parse(port);
 
-                Console.ForegroundColor = ConsoleColor.White;
-                Console.Write("Pleace indicate the largest number of clients ");
-                Console.ForegroundColor = ConsoleColor.Green;
-                MaxClient = int.Parse(Console.ReadLine());
+                Console.Write("Max clients [10]: ");
+                string max = Console.ReadLine();
+                MaxClients = string.IsNullOrEmpty(max) ? 10 : int.Parse(max);
 
-                Console.ForegroundColor = ConsoleColor.White;
-                Console.Write("Specify the token lifetime ");
-                Console.ForegroundColor = ConsoleColor.Green;
-                Duration = int.Parse(Console.ReadLine());
+                Console.Write("Token lifetime (seconds) [3600]: ");
+                string duration = Console.ReadLine();
+                TokenDuration = string.IsNullOrEmpty(duration) ? 3600 : int.Parse(duration);
 
-                StreamWriter streamWriter = new StreamWriter(Path);
-                streamWriter.WriteLine(IpAddress);
-                streamWriter.WriteLine(ServerPort.ToString());
-                streamWriter.WriteLine(MaxClient.ToString());
-                streamWriter.WriteLine(Duration.ToString());
-                streamWriter.Close();
+                using StreamWriter writer = new StreamWriter(configPath);
+                writer.WriteLine(ServerIpAddress);
+                writer.WriteLine(ServerPort);
+                writer.WriteLine(MaxClients);
+                writer.WriteLine(TokenDuration);
+                writer.Close();
+
+                Console.WriteLine("Settings saved");
             }
-
-            Console.ForegroundColor = ConsoleColor.White;
-            Console.Write("To change, write the command: ");
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine("/config");
         }
 
-        static string SetCommandClient(string Command)
+        static string ProcessClientCommand(string command)
         {
-
-
-            if (Command.StartsWith("/connect"))
+            if (command.StartsWith("/connect"))
             {
-                string[] parts = Command.Split(' ');
+                string[] parts = command.Split(' ');
                 if (parts.Length != 3) return "/auth_fail";
 
                 string login = parts[1];
@@ -277,60 +247,88 @@ namespace Server
 
                 using var db = new DbContexted();
 
-                if (db.blackLists.Any(x => x.Login == login))
+                if (db.BlackLists.Any(x => x.Login == login))
                     return "/banned";
 
                 var user = db.Users.FirstOrDefault(x => x.Login == login && x.Password == password);
                 if (user == null)
                     return "/auth_fail";
 
-                if (AllClients.Count < MaxClient)
+                lock (ActiveClients)
                 {
-                    Classes.Client newClient = new Classes.Client();
-                    AllClients.Add(newClient);
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"New client connection: " + newClient.Token);
+                    if (ActiveClients.Count >= MaxClients)
+                    {
+                        Console.WriteLine("Server is full");
+                        return "/limit";
+                    }
 
+                    Client newClient = new Client(login);
+                    ActiveClients.Add(newClient);
+                    Console.WriteLine($"New client connected: {newClient.Token} ({login})");
                     return newClient.Token;
-
                 }
-                else
-                {
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"There is not enougt space on the license server");
-                    return "/limit";
-                }
+            }
+            else if (command.StartsWith("/register"))
+            {
+                string[] parts = command.Split(' ');
+                if (parts.Length != 3) return "/register_fail";
 
+                string login = parts[1];
+                string password = parts[2];
 
+                using var db = new DbContexted();
+
+                if (db.Users.Any(x => x.Login == login))
+                    return "/register_exists";
+
+                db.Users.Add(new Users { Login = login, Password = password });
+                db.SaveChanges();
+
+                Console.WriteLine($"New user registered: {login}");
+                return "/register_success";
             }
             else
             {
-                Client c = AllClients.Find(x => x.Token == Command);
-                return c != null ? "/connect" : "/disconnect";
+                lock (ActiveClients)
+                {
+                    Client client = ActiveClients.FirstOrDefault(x => x.Token == command);
+                    return client != null ? "/connected" : "/disconnect";
+                }
             }
-            return null;
         }
-        public static void ConnectServer()
+
+        public static void ListenForClients()
         {
-            IPEndPoint EndPoint = new IPEndPoint(ServerIpAddress, ServerPort);
-            Socket SocketListener = new Socket(
-                AddressFamily.InterNetwork,
-                SocketType.Stream,
-                ProtocolType.Tcp);
-            SocketListener.Bind(EndPoint);
-            SocketListener.Listen(10);
+            IPEndPoint endPoint = new IPEndPoint(ServerIpAddress, ServerPort);
+            Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+
+            listener.Bind(endPoint);
+            listener.Listen(10);
+
+            Console.WriteLine($"Server listening on {ServerIpAddress}:{ServerPort}");
+
             while (true)
             {
-                Socket Handler = SocketListener.Accept();
-                byte[] Bytes = new byte[10485760];
-                int ByteRec = Handler.Receive(Bytes);
+                Socket handler = listener.Accept();
 
-                string Message = Encoding.UTF8.GetString(Bytes, 0, ByteRec);
-                string Response = SetCommandClient(Message);
+                Thread clientThread = new Thread(() =>
+                {
+                    try
+                    {
+                        byte[] buffer = new byte[1024];
+                        int bytesReceived = handler.Receive(buffer);
+                        string message = Encoding.UTF8.GetString(buffer, 0, bytesReceived);
 
-                Handler.Send(Encoding.UTF8.GetBytes(Response));
+                        string response = ProcessClientCommand(message);
+                        handler.Send(Encoding.UTF8.GetBytes(response));
+                    }
+                    finally
+                    {
+                        handler.Close();
+                    }
+                });
+                clientThread.Start();
             }
-
         }
     }
 }

@@ -9,8 +9,9 @@ namespace Server.Classes
     public class Client
     {
         public string Token {  get; set; }
+        public string Login { get; set; }
         public DateTime DateConnect { get; set; }
-        public Client()
+        public Client(string login)
         {
             Random random = new Random();
             string chars = "QWERTYUIOPASDFGHJKLZXCVBNMqwertyuiopasdfghjklzxcvbnm0123456789";
