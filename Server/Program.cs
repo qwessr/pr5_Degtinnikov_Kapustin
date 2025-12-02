@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
+using Microsoft.EntityFrameworkCore;
 using Server.Classes;
 
 namespace Server
@@ -134,7 +135,8 @@ namespace Server
 
             using var db = new DbContexted();
 
-            if (!db.Users.Any(x => x.Login == login))
+            var user = db.Users.FirstOrDefault(x => x.Login == login);
+            if (user == null)
             {
                 Console.WriteLine("User does not exist");
                 return;
@@ -142,7 +144,11 @@ namespace Server
 
             if (!db.BlackLists.Any(x => x.Login == login))
             {
-                db.BlackLists.Add(new BlackList { Login = login });
+                db.BlackLists.Add(new BlackList
+                {
+                    Login = login,
+                    Token = user.Token 
+                });
                 db.SaveChanges();
 
                 lock (ActiveClients)
@@ -152,6 +158,9 @@ namespace Server
                     {
                         ActiveClients.Remove(activeClient);
                         Console.WriteLine($"Active session for {login} terminated");
+
+                        user.Token = null;
+                        db.SaveChanges();
                     }
                 }
 
@@ -235,65 +244,131 @@ namespace Server
             }
         }
 
-        static string ProcessClientCommand(string command)
+        static string ProcessClientCommand(string command, Socket handler)
         {
-            if (command.StartsWith("/connect"))
+            try
             {
-                string[] parts = command.Split(' ');
-                if (parts.Length != 3) return "/auth_fail";
+                Console.WriteLine($"Processing command: {command}");
 
-                string login = parts[1];
-                string password = parts[2];
-
-                using var db = new DbContexted();
-
-                if (db.BlackLists.Any(x => x.Login == login))
-                    return "/banned";
-
-                var user = db.Users.FirstOrDefault(x => x.Login == login && x.Password == password);
-                if (user == null)
-                    return "/auth_fail";
-
-                lock (ActiveClients)
+                if (command.StartsWith("/connect"))
                 {
-                    if (ActiveClients.Count >= MaxClients)
+                    string[] parts = command.Split(' ');
+                    if (parts.Length != 3) return "/auth_fail";
+
+                    string login = parts[1];
+                    string password = parts[2];
+
+                    using var db = new DbContexted();
+
+                    if (db.BlackLists.Any(x => x.Login == login))
+                        return "/banned";
+
+                    var user = db.Users.FirstOrDefault(x => x.Login == login);
+                    if (user == null)
                     {
-                        Console.WriteLine("Server is full");
-                        return "/limit";
+                        Console.WriteLine($"User {login} not found");
+                        return "/auth_fail";
                     }
 
-                    Client newClient = new Client(login);
-                    ActiveClients.Add(newClient);
-                    Console.WriteLine($"New client connected: {newClient.Token} ({login})");
-                    return newClient.Token;
+                    Console.WriteLine($"Found user: {login}, Password in DB: {user.Password}, Provided password: {password}");
+
+                    if (user.Password != password)
+                    {
+                        Console.WriteLine($"Password mismatch for user {login}");
+                        return "/auth_fail";
+                    }
+
+                    lock (ActiveClients)
+                    {
+                        if (ActiveClients.Count >= MaxClients)
+                        {
+                            Console.WriteLine("Server is full");
+                            return "/limit";
+                        }
+
+                        var existingClient = ActiveClients.FirstOrDefault(c => c.Login == login);
+                        if (existingClient != null)
+                        {
+                            ActiveClients.Remove(existingClient);
+                            Console.WriteLine($"Disconnected existing session for {login}");
+                        }
+
+                        Client newClient = new Client(login);
+                        ActiveClients.Add(newClient);
+
+                        user.Token = newClient.Token;
+                        db.SaveChanges();
+
+                        Console.WriteLine($"New client connected: {newClient.Token} ({login})");
+
+                        return newClient.Token;
+                    }
                 }
-            }
-            else if (command.StartsWith("/register"))
-            {
-                string[] parts = command.Split(' ');
-                if (parts.Length != 3) return "/register_fail";
-
-                string login = parts[1];
-                string password = parts[2];
-
-                using var db = new DbContexted();
-
-                if (db.Users.Any(x => x.Login == login))
-                    return "/register_exists";
-
-                db.Users.Add(new Users { Login = login, Password = password });
-                db.SaveChanges();
-
-                Console.WriteLine($"New user registered: {login}");
-                return "/register_success";
-            }
-            else
-            {
-                lock (ActiveClients)
+                else if (command.StartsWith("/register"))
                 {
-                    Client client = ActiveClients.FirstOrDefault(x => x.Token == command);
-                    return client != null ? "/connected" : "/disconnect";
+                    string[] parts = command.Split(' ');
+                    if (parts.Length != 3) return "/register_fail";
+
+                    string login = parts[1];
+                    string password = parts[2];
+
+                    using var db = new DbContexted();
+
+                    if (db.Users.Any(x => x.Login == login))
+                        return "/register_exists";
+                    
+                    try
+                    {
+                        Client newClient = new Client(login);
+                        var newUser = new Users
+                        {
+                            Login = login,
+                            Password = password,
+                            Token = newClient.Token 
+                        };
+
+                        db.Users.Add(newUser);
+                        db.SaveChanges();
+
+                        Console.WriteLine($"New user registered: {login}");
+                        return "/register_success";
+                    }
+                    catch (DbUpdateException dbEx)
+                    {
+                        Console.WriteLine($"Database error during registration: {dbEx.Message}");
+                        if (dbEx.InnerException != null)
+                        {
+                            Console.WriteLine($"Inner exception: {dbEx.InnerException.Message}");
+                        }
+                        return "/register_fail";
+                    }
                 }
+                else
+                {
+                    lock (ActiveClients)
+                    {
+                        Client client = ActiveClients.FirstOrDefault(x => x.Token == command);
+                        if (client != null)
+                        {
+                            client.DateConnect = DateTime.Now;
+                            return "/connected";
+                        }
+                        return "/disconnect";
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in ProcessClientCommand: {ex.Message}");
+                Console.WriteLine($"StackTrace: {ex.StackTrace}");
+
+                if (ex.InnerException != null)
+                {
+                    Console.WriteLine($"Inner exception: {ex.InnerException.Message}");
+                    Console.WriteLine($"Inner stack trace: {ex.InnerException.StackTrace}");
+                }
+
+                return "/auth_fail";
             }
         }
 
@@ -302,32 +377,51 @@ namespace Server
             IPEndPoint endPoint = new IPEndPoint(ServerIpAddress, ServerPort);
             Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
 
-            listener.Bind(endPoint);
-            listener.Listen(10);
-
-            Console.WriteLine($"Server listening on {ServerIpAddress}:{ServerPort}");
-
-            while (true)
+            try
             {
-                Socket handler = listener.Accept();
+                listener.Bind(endPoint);
+                listener.Listen(10);
 
-                Thread clientThread = new Thread(() =>
+                Console.WriteLine($"Server listening on {ServerIpAddress}:{ServerPort}");
+
+                while (true)
                 {
-                    try
-                    {
-                        byte[] buffer = new byte[1024];
-                        int bytesReceived = handler.Receive(buffer);
-                        string message = Encoding.UTF8.GetString(buffer, 0, bytesReceived);
+                    Socket handler = listener.Accept();
 
-                        string response = ProcessClientCommand(message);
-                        handler.Send(Encoding.UTF8.GetBytes(response));
-                    }
-                    finally
+                    Thread clientThread = new Thread(() =>
                     {
-                        handler.Close();
-                    }
-                });
-                clientThread.Start();
+                        try
+                        {
+                            byte[] buffer = new byte[1024];
+                            int bytesReceived = handler.Receive(buffer);
+                            if (bytesReceived == 0) return;
+
+                            string message = Encoding.UTF8.GetString(buffer, 0, bytesReceived);
+
+                            string response = ProcessClientCommand(message, handler);
+
+                            handler.Send(Encoding.UTF8.GetBytes(response));
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Error handling client: {ex.Message}");
+                        }
+                        finally
+                        {
+                            try
+                            {
+                                handler.Shutdown(SocketShutdown.Both);
+                                handler.Close();
+                            }
+                            catch { }
+                        }
+                    });
+                    clientThread.Start();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Server error: {ex.Message}");
             }
         }
     }

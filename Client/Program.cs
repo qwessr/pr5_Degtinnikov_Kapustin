@@ -130,48 +130,66 @@ namespace Client
 
             try
             {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"Connecting to {ServerIpAddress}:{ServerPort}...");
+
                 socket.Connect(endPoint);
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine("Connected to server!");
+
+                string msg = $"/connect {login} {password}";
+                byte[] data = Encoding.UTF8.GetBytes(msg);
+                socket.Send(data);
+
+                byte[] buffer = new byte[1024];
+                int size = socket.Receive(buffer);
+                string response = Encoding.UTF8.GetString(buffer, 0, size);
+
+                if (response == "/auth_fail")
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Incorrect login or password");
+                    socket.Close();
+                    return;
+                }
+
+                if (response == "/banned")
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Your account is in blacklist!");
+                    socket.Close();
+                    return;
+                }
+
+                if (response == "/limit")
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("No available licenses.");
+                    socket.Close();
+                    return;
+                }
+
+                ClientToken = response;
+                ClientDateConnection = DateTime.Now;
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine("Successfully connected!");
+                Console.WriteLine($"Your token: {ClientToken}");
+                Console.WriteLine($"Connection time: {ClientDateConnection:HH:mm:ss dd.MM.yyyy}");
             }
             catch (Exception ex)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
                 Console.WriteLine($"Connection error: {ex.Message}");
-                return;
             }
-
-            string msg = $"/connect {login} {password}";
-            socket.Send(Encoding.UTF8.GetBytes(msg));
-
-            byte[] buffer = new byte[1024];
-            int size = socket.Receive(buffer);
-            string response = Encoding.UTF8.GetString(buffer, 0, size);
-
-            if (response == "/auth_fail")
+            finally
             {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine("Incorrect login or password");
-                return;
+                if (socket.Connected)
+                {
+                    socket.Close();
+                }
             }
-
-            if (response == "/banned")
-            {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine("Your account is in blacklist!");
-                return;
-            }
-
-            if (response == "/limit")
-            {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine("No available licenses.");
-                return;
-            }
-
-            ClientToken = response;
-            ClientDateConnection = DateTime.Now;
-
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine("Successfully connected. Your token: " + ClientToken);
         }
 
         public static void CheckToken()
@@ -181,39 +199,44 @@ namespace Client
                 if (!String.IsNullOrEmpty(ClientToken))
                 {
                     IPEndPoint EndPoint = new IPEndPoint(ServerIpAddress, ServerPort);
-                    Socket Socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                    Socket Socket = new Socket(
+                        AddressFamily.InterNetwork,
+                        SocketType.Stream,
+                        ProtocolType.Tcp);
 
                     try
                     {
-                        Socket.Connect(EndPoint);
+                        Socket.Connect(EndPoint); ;
 
-                        if (Socket.Connected)
-                        {
-                            Socket.Send(Encoding.UTF8.GetBytes(ClientToken));
-                            byte[] Bytes = new byte[1024];
-                            int ByteRec = Socket.Receive(Bytes);
-                            string Response = Encoding.UTF8.GetString(Bytes, 0, ByteRec);
-
-                            if (Response == "/disconnect")
-                            {
-                                Console.ForegroundColor = ConsoleColor.Red;
-                                Console.WriteLine("The client is disconnected from server");
-                                ClientToken = String.Empty;
-                            }
-                        }
                     }
                     catch (Exception exp)
                     {
                         Console.ForegroundColor = ConsoleColor.Red;
                         Console.WriteLine("Error: " + exp.Message);
                     }
-                    finally
+
+                    if (Socket.Connected)
                     {
-                        Socket.Close();
+
+                        Socket.Send(Encoding.UTF8.GetBytes(ClientToken));
+
+                        byte[] Bytes = new byte[10485760];
+                        int ByteRec = Socket.Receive(Bytes);
+
+                        string Response = Encoding.UTF8.GetString(Bytes, 0, ByteRec);
+                        if (Response == "/disconnect")
+                        {
+                            Console.ForegroundColor = ConsoleColor.Red;
+                            Console.WriteLine("The client is disconnected from server");
+                            ClientToken = String.Empty;
+                        }
                     }
                 }
+
                 Thread.Sleep(1000);
             }
+
+
         }
 
         public static void GetStatus()

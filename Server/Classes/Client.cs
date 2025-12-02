@@ -8,9 +8,10 @@ namespace Server.Classes
 {
     public class Client
     {
-        public string Token {  get; set; }
+        public string Token { get; set; }
         public string Login { get; set; }
         public DateTime DateConnect { get; set; }
+
         public Client(string login)
         {
             Random random = new Random();
@@ -20,6 +21,7 @@ namespace Server.Classes
                                          .Select(x => x[random.Next(chars.Length)])
                                          .ToArray());
 
+            Login = login; 
             DateConnect = DateTime.Now;
         }
     }
